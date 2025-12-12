@@ -1,0 +1,187 @@
+
+name: Package & Release (dev/uat/pro)
+
+on:
+  # Manual run (choose environment and version)
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        required: true
+        options: [dev, uat, pro]
+        default: dev
+      version:
+        description: "Release version or build label (e.g., v1.2.3 or build-2025.12.12)"
+        required: true
+        default: "v0.0.0"
+  # Auto on branch push
+  push:
+    branches:
+      - dev
+      - uat
+      - pro
+    # Optional: only trigger when relevant paths change
+    # paths:
+    #   - 'src/**'
+    #   - 'config/**'
+    #   - '.github/workflows/package-release.yml'
+
+jobs:
+  build-and-zip:
+    name: Build and Zip
+    runs-on: ubuntu-latest
+
+    # Resolve environment: if manual, use input; if push, infer from branch
+    env:
+      TARGET_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || github.ref_name }}
+      # Zip filename includes env + version (manual) OR env + commit sha (push)
+      ZIP_NAME: ${{ (github.event_name == 'workflow_dispatch' && format('{0}-{1}.zip', github.event.inputs.environment, github.event.inputs.version)) || format('{0}-{1}.zip', github.ref_name, github.sha) }}
+
+    # Apply approvals / secrets via environment gates
+    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Replace this block with your real build commands ----
+      - name: Build
+        run: |
+          echo "Run your build here for $TARGET_ENV"
+          # Examples:
+          # npm ci && npm run build
+          # dotnet restore && dotnet publish -c Release -o out
+          # mvn -B -DskipTests package && mkdir -p out && cp target/*.jar out/
+      # -----------------------------------------------------------
+
+      - name: Prepare artifact folder
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          # Copy build outputs into dist
+          # e.g. cp -r out/* dist/
+          # e.g. cp -r build/* dist/
+
+          echo "Applying environment-specific config for $TARGET_ENV"
+          case "$TARGET_ENV" in
+            dev)
+              cp config/dev.json dist/config.json
+              ;;
+            uat)
+              cp config/uat.json dist/config.json
+              ;;
+            pro)
+              cp config/pro.json dist/config.json
+              ;;
+            *)
+              echo "Unknown TARGET_ENV=$TARGET_ENV"; exit 1;
+              ;;
+          esac
+
+      - name: Zip artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          zip -r "$ZIP_NAME" dist
+
+      - name: Zip artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist -DestinationPath "$env:ZIP_NAME"
+
+      - name: Generate checksums
+        run: |
+          sha256sum "$ZIP_NAME" > "$ZIP_NAME.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARGET_ENV }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.sha }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sha256
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub Release (uat/pro only)
+    needs: build-and-zip
+    runs-on: ubuntu-latest
+
+    # Only run for uat/pro (manual or push)
+    if: >
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.environment == 'uat' || github.event.inputs.environment == 'pro')) ||
+      (github.event_name == 'push' && (github.ref_name == 'uat' || github.ref_name == 'pro'))
+
+    # Gate with environment approvals
+    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || github.ref_name }}
+
+    env:
+      TARGET_ENV: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || github.ref_name }}
+      # Tag/version rules:
+      # - Manual: use provided version (required)
+      # - Push: auto-tag from branch + date + short sha
+      AUTO_TAG: ${{ format('{0}-{1}-{2}', github.ref_name, github.run_id, github.sha) }}
+      IS_PRERELEASE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'uat') || (github.event_name == 'push' && github.ref_name == 'uat') }}
+
+    steps:
+      - name: Determine tag & names
+        id: names
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+            RELEASE_NAME="Release ${TAG} (${TARGET_ENV})"
+            ARTIFACT_NAME="${TARGET_ENV}-${{ github.event.inputs.version }}"
+            ZIP_NAME="${TARGET_ENV}-${{ github.event.inputs.version }}.zip"
+          else
+            TAG="${AUTO_TAG}"
+            RELEASE_NAME="Auto Release ${TAG} (${TARGET_ENV})"
+            ARTIFACT_NAME="${TARGET_ENV}-${{ github.sha }}"
+            ZIP_NAME="${TARGET_ENV}-${{ github.sha }}.zip"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download artifact from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.names.outputs.artifact_name }}
+          path: .
+
+      - name: Create/Update Git tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ steps.names.outputs.tag }}';
+            const sha = context.payload.after || context.sha;
+            try {
+              await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${tag}`
+              });
+              core.info(`Tag ${tag} already exists`);
+            } catch {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/tags/${tag}`,
+                sha
+              });
+              core.info(`Created tag ${tag}`);
+            }
+
+      - name: Create GitHub Release (pre-release for uat, full for pro)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.names.outputs.tag }}
+          name: ${{ steps.names.outputs.release_name }}
+          draft: false
+          prerelease: ${{ env.IS_PRERELEASE }}
+          files: |
+            ${{ steps.names.outputs.zip_name }}
+            ${{ steps.names.outputs.zip_name }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
